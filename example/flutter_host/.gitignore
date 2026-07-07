@@ -43,3 +43,8 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Bundled model for the Firebase Test Lab asset-staging fallback (FTL has no
+# adb push — see integration_test/litertlm_dart_test.dart). Multi-GB binary,
+# never committed; staged locally only when building an FTL APK.
+/assets/models/

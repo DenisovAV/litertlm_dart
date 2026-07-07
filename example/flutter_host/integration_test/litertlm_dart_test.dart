@@ -11,6 +11,13 @@
 /// via `xcrun devicectl device copy to`; Android: `adb push` + /data/local
 /// or app dir). On iOS/macOS the app sandbox must be able to open the path.
 ///
+/// Firebase Test Lab fallback: FTL has no adb push, so when MODEL_PATH is
+/// unset this suite falls back to an asset bundled inside the APK
+/// (`assets/models/gemma4.litertlm`) and stages it once, in setUpAll, to a
+/// writable file under the app-support directory. The desktop/CLI
+/// `--dart-define=MODEL_PATH=...` override keeps working unchanged — the
+/// asset fallback only kicks in when that define is absent.
+///
 /// Until the 0.1.0 extraction lands, everything past the contract test is
 /// expected to FAIL with UnimplementedError — that is the TDD red state, not
 /// a broken suite.
@@ -18,14 +25,44 @@ library;
 
 import 'dart:io';
 
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:litertlm_dart/litertlm_dart.dart';
+import 'package:path_provider/path_provider.dart';
 
-const _modelPath = String.fromEnvironment('MODEL_PATH');
+const _modelPathOverride = String.fromEnvironment('MODEL_PATH');
+const _bundledModelAsset = 'assets/models/gemma4.litertlm';
+
+late final String _modelPath;
+
+/// Stages the bundled model asset to a writable file once, reusing it across
+/// every test in this suite. Only used when MODEL_PATH is not supplied (e.g.
+/// on Firebase Test Lab, which has no adb push).
+Future<String> _stageBundledModel() async {
+  final dir = await getApplicationSupportDirectory();
+  final staged = File('${dir.path}/gemma4.litertlm');
+  if (staged.existsSync() && staged.lengthSync() > 0) {
+    return staged.path;
+  }
+  final data = await rootBundle.load(_bundledModelAsset);
+  await staged.writeAsBytes(
+    data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+    flush: true,
+  );
+  return staged.path;
+}
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+
+  setUpAll(() async {
+    if (_modelPathOverride.isNotEmpty) {
+      _modelPath = _modelPathOverride;
+      return;
+    }
+    _modelPath = await _stageBundledModel();
+  });
 
   testWidgets('MODEL_PATH is staged and readable', (_) async {
     expect(
