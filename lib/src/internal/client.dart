@@ -400,8 +400,44 @@ class LiteRtLmFfiClient {
       lib = DynamicLibrary.open(_libraries.mainLibraryPath);
       proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
     } else if (Platform.isMacOS) {
-      lib = DynamicLibrary.open(_libraries.mainLibraryPath);
+      // In a Flutter app the main lib is a `.framework` whose bundled Mach-O
+      // carries an @rpath to its companions (GemmaModelConstraintProvider,
+      // MetalAccelerator) staged alongside — a bare DynamicLibrary.open then
+      // resolves them. But when the locator points at a DIRECTORY of bare
+      // dylibs (LibraryLocator.fromDirectory — CLI/server, no framework, no
+      // rpath), that @rpath resolves to nothing and opening libLiteRtLm.dylib
+      // aborts the process. So: if the main lib lives in a real directory
+      // (path contains a separator and the companions sit next to it),
+      // RTLD_GLOBAL-preload those companions via StreamProxy first — same
+      // technique Linux uses below — so the main lib's @rpath deps are
+      // already resident. Framework-path loads skip this (no companion files
+      // next to a framework path) and behave exactly as before.
       proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
+      final mainDir = File(_libraries.mainLibraryPath).parent;
+      final companionCandidates = [
+        '${mainDir.path}/libGemmaModelConstraintProvider.dylib',
+        '${mainDir.path}/libLiteRtMetalAccelerator.dylib',
+      ];
+      final anyCompanionPresent = companionCandidates.any(
+        (p) => File(p).existsSync(),
+      );
+      if (anyCompanionPresent) {
+        final loadGlobal = proxyLib
+            .lookupFunction<
+              Pointer Function(Pointer<Utf8>),
+              Pointer Function(Pointer<Utf8>)
+            >('stream_proxy_load_global');
+        for (final path in companionCandidates) {
+          if (!File(path).existsSync()) continue;
+          final p = path.toNativeUtf8();
+          final h = loadGlobal(p);
+          calloc.free(p);
+          if (h == nullptr) {
+            _log('[LiteRtLmFfi] macOS: companion preload failed for $path');
+          }
+        }
+      }
+      lib = DynamicLibrary.open(_libraries.mainLibraryPath);
     } else if (Platform.isLinux) {
       // Load order matters: libLiteRt.so must be loaded first with
       // RTLD_GLOBAL so libLiteRtLm.so (built with litert_link_capi_so=true)
@@ -715,8 +751,36 @@ class LiteRtLmFfiClient {
       // thread loaded. Per-step perf logs inside the isolate go to stdout —
       // they are diagnostics, not routed through the caller's LogSink.
       final mainLibPath = _libraries.mainLibraryPath;
+      final proxyLibPath = _libraries.proxyLibraryPath;
+      // On macOS, the fresh isolate re-opens the main lib COLD — it does not
+      // inherit the parent isolate's RTLD_GLOBAL companion preloads. With a
+      // framework main lib (@rpath resolves) that's fine; with bare dylibs
+      // from LibraryLocator.fromDirectory the main lib's
+      // @rpath/libGemmaModelConstraintProvider.dylib is unresolved and the
+      // open aborts the process. So preload the companions here too, the same
+      // way _ensureBindings does on the main thread. Only paths (Strings)
+      // cross the isolate boundary.
+      final macosCompanions = Platform.isMacOS
+          ? [
+              '${File(mainLibPath).parent.path}/libGemmaModelConstraintProvider.dylib',
+              '${File(mainLibPath).parent.path}/libLiteRtMetalAccelerator.dylib',
+            ].where((p) => File(p).existsSync()).toList()
+          : const <String>[];
       final engineAddr = await Isolate.run(() {
         final isolateSw = Stopwatch()..start();
+        if (macosCompanions.isNotEmpty) {
+          final proxy = DynamicLibrary.open(proxyLibPath);
+          final loadGlobal = proxy
+              .lookupFunction<
+                Pointer Function(Pointer<Utf8>),
+                Pointer Function(Pointer<Utf8>)
+              >('stream_proxy_load_global');
+          for (final path in macosCompanions) {
+            final p = path.toNativeUtf8();
+            loadGlobal(p);
+            calloc.free(p);
+          }
+        }
         final lib = DynamicLibrary.open(mainLibPath);
         // ignore: avoid_print — isolate-local perf diagnostic
         print(

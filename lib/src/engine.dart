@@ -23,6 +23,11 @@ abstract final class LiteRtLm {
   /// Throws [LibraryLoadException] if the native libraries cannot be located,
   /// [EngineCreateException] (with the native-log tail) if the model fails to
   /// load.
+  ///
+  /// [captureNativeLog] (default true) redirects native stderr (absl/glog) to
+  /// a temp file so [EngineCreateException] can carry it — but on macOS/Linux
+  /// that redirect also swallows the process's own stdout. A CLI/server that
+  /// prints to the console should pass `false`.
   static Future<Engine> createEngine({
     required String modelPath,
     Backend backend = Backend.cpu,
@@ -34,11 +39,13 @@ abstract final class LiteRtLm {
     LibraryLocator? libraries,
     String? androidNativeLibDir,
     LogSink log = stdoutLogSink,
+    bool captureNativeLog = true,
   }) async {
     final client = LiteRtLmFfiClient(
       log: log,
       androidNativeLibDir: androidNativeLibDir,
       libraries: libraries,
+      captureNativeLogInDebug: captureNativeLog,
     );
     try {
       await client.initialize(
