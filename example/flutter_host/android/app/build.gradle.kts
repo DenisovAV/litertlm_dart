@@ -7,7 +7,9 @@ plugins {
 android {
     namespace = "dev.flutterberlin.litertlm_host"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    // Pinned to match the flutter_gemma example (packages/flutter_gemma/example/android/app/build.gradle.kts):
+    // the LiteRT-LM native prebuilts are built against this NDK.
+    ndkVersion = "28.2.13676358"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -19,7 +21,10 @@ android {
         applicationId = "dev.flutterberlin.litertlm_host"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // minSdk 24 to match the flutter_gemma example — Android API < 30 can
+        // hit a libLiteRtLm.so pthread_cond_clockwait issue (#265), so this is
+        // a floor, not a workaround for that (this test device is API 32).
+        minSdk = 24
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

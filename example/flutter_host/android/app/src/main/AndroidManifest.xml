@@ -1,8 +1,27 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!-- Read access to shared/public storage so the integration-test model
+         (staged at /sdcard/<file>.litertlm) can be opened by the app process.
+         maxSdkVersion=32: on API 33+ READ_EXTERNAL_STORAGE is superseded by
+         granular media permissions and no longer grants generic file reads;
+         this app only ever needs to run this way on API <= 32 test devices. -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <!-- requestLegacyExternalStorage below is only honored when targetSdk is
+         29 or lower — this app's targetSdk (via flutter.targetSdkVersion) is
+         much higher, so scoped storage is enforced regardless of that flag.
+         MANAGE_EXTERNAL_STORAGE (All Files Access) is the API 30+ escape
+         hatch: it must be granted out of band via adb shell appops (uid
+         flag) set to MANAGE_EXTERNAL_STORAGE allow (there is no runtime
+         prompt path suitable for CI or test automation). -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
     <application
         android:label="litertlm_host"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:requestLegacyExternalStorage="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -25,6 +44,19 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- GPU backend (LiteRT-LM): on Android 12+ the app linker namespace
+             can't dlopen the vendor OpenCL ICD without declaring its loader.
+             libvndksupport.so provides android_load_sphal_library(), which the
+             v0.13.x OpenCL loader uses to reach libOpenCL.so in the sphal
+             namespace. Without it OpenCL fails to load and the engine falls
+             back to WebGPU, which hard-freezes some Mali drivers on the vision
+             encoder (#324). Required per Google's LiteRT-LM Android docs. -->
+        <uses-native-library android:name="libvndksupport.so" android:required="false"/>
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false"/>
+        <uses-native-library android:name="libOpenCL-car.so" android:required="false"/>
+        <uses-native-library android:name="libOpenCL-pixel.so" android:required="false"/>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data
