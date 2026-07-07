@@ -81,10 +81,20 @@ void main() {
     });
   });
 
-  test('createEngine is contract-only in 0.0.x', () {
-    expect(
-      () => LiteRtLm.createEngine(modelPath: '/tmp/x.litertlm'),
-      throwsUnimplementedError,
+  test('createEngine surfaces a typed failure without native libs', () async {
+    // On the host test VM the native libraries can't be loaded, so
+    // createEngine fails — but it must fail with the package's TYPED
+    // hierarchy (a real engine run is exercised by the integration host),
+    // never a raw Exception or UnimplementedError.
+    await expectLater(
+      LiteRtLm.createEngine(
+        modelPath: '/tmp/does-not-exist.litertlm',
+        libraries: const LibraryLocator.custom(
+          mainLibraryPath: '/tmp/no-such-lib.so',
+          proxyLibraryPath: '/tmp/no-such-proxy.so',
+        ),
+      ),
+      throwsA(isA<LiteRtLmException>()),
     );
   });
 }

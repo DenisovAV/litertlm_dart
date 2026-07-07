@@ -4,4 +4,11 @@
 /// flutter_gemma_litertlm client. `npu` requires platform prerequisites
 /// (Qualcomm QNN dispatch on Android, Intel NPU dispatch on Windows) bundled
 /// with the native prebuilts.
-enum Backend { cpu, gpu, npu }
+enum Backend {
+  cpu,
+  gpu,
+  npu;
+
+  /// The lowercase string the native C API expects as `backend_str`.
+  String get wireName => name;
+}

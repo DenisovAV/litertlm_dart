@@ -357,6 +357,31 @@ class LiteRtLmFfiClient {
   /// where redirection isn't wired (currently it works on macOS + iOS).
   String? get nativeLogPath => _nativeLogPath;
 
+  /// The resolved locator — exposed so the public API can report the exact
+  /// paths it tried in a [LibraryLoadException].
+  LibraryLocator get librariesForDiagnostics => _libraries;
+
+  /// The last [maxLines] of captured native stderr (absl/glog), or null when
+  /// no redirect log exists. Used to enrich an [EngineCreateException] so a
+  /// model-load failure carries the native error that caused it. Does NOT
+  /// truncate the log (unlike [dumpNativeLog]).
+  String? nativeLogTail({int maxLines = 40}) {
+    final p = _nativeLogPath;
+    if (p == null) return null;
+    try {
+      final f = File(p);
+      if (!f.existsSync()) return null;
+      final lines = f.readAsLinesSync();
+      if (lines.isEmpty) return null;
+      final tail = lines.length <= maxLines
+          ? lines
+          : lines.sublist(lines.length - maxLines);
+      return tail.join('\n');
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Load the native library and create bindings.
   void _ensureBindings() {
     if (_bindings != null) return;
@@ -558,6 +583,7 @@ class LiteRtLmFfiClient {
   Future<void> initialize({
     required String modelPath,
     String backend = 'gpu',
+    String? visionBackend,
     int maxTokens = 2048,
     String? cacheDir,
     bool enableVision = false,
@@ -575,7 +601,11 @@ class LiteRtLmFfiClient {
     // Create engine settings
     final modelPathPtr = modelPath.toNativeUtf8();
     final backendPtr = backend.toNativeUtf8();
-    final visionBackendPtr = enableVision ? backend.toNativeUtf8() : nullptr;
+    // Vision may run on a DIFFERENT backend than text — the #324 Mali fix
+    // uses vision=cpu, text=gpu. Defaults to `backend` when unspecified.
+    final visionBackendPtr = enableVision
+        ? (visionBackend ?? backend).toNativeUtf8()
+        : nullptr;
     final audioBackendPtr = enableAudio ? 'cpu'.toNativeUtf8() : nullptr;
 
     try {
