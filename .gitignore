@@ -2,3 +2,4 @@
 pubspec.lock
 build/
 .DS_Store
+native/litert_lm/prebuilt/
