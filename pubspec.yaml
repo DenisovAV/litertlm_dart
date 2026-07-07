@@ -12,6 +12,11 @@ environment:
 dependencies:
   ffi: ^2.1.0
   mutex: ^3.1.0
+  # Native Assets build hook (hook/build.dart owns the libLiteRtLm bundle:
+  # fetches per-platform prebuilts from the GitHub release, SHA256-verified).
+  hooks: ^2.0.0
+  code_assets: ^1.2.0
+  crypto: ^3.0.6
 
 dev_dependencies:
   lints: ^6.0.0
