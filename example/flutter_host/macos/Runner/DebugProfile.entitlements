@@ -2,11 +2,29 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- App Sandbox is OFF here (unlike the flutter_gemma reference example,
+	     which keeps it ON and stages the model into the sandbox container).
+	     This is a local integration-test host only, never shipped, and the
+	     test suite reads an arbitrary --dart-define=MODEL_PATH from outside
+	     the container (e.g. /Users/.../gemma-4-E2B-it.litertlm), which the
+	     sandbox's file-read entitlements can't cover without pre-staging. -->
 	<key>com.apple.security.app-sandbox</key>
-	<true/>
+	<false/>
 	<key>com.apple.security.cs.allow-jit</key>
 	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<true/>
 	<key>com.apple.security.network.server</key>
+	<true/>
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
 	<true/>
 </dict>
 </plist>

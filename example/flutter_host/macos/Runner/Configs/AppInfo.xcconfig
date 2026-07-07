@@ -12,3 +12,9 @@ PRODUCT_BUNDLE_IDENTIFIER = dev.flutterberlin.litertlmHost
 
 // The copyright displayed in application information
 PRODUCT_COPYRIGHT = Copyright © 2026 dev.flutterberlin. All rights reserved.
+
+// Restricted entitlements (extended-virtual-addressing, increased-memory-limit)
+// require a real development-team signature — ad-hoc ("-") signing fails the
+// build. Mirrors flutter_gemma's example/macos/Runner/Configs/AppInfo.xcconfig.
+DEVELOPMENT_TEAM = 2U7DD3DNRL
+CODE_SIGN_IDENTITY = Apple Development

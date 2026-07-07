@@ -3,3 +3,6 @@ pubspec.lock
 build/
 .DS_Store
 native/litert_lm/prebuilt/
+*.profraw
+example/**/build/
+example/**/.dart_tool/
