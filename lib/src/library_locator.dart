@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'package:meta/meta.dart';
+
 /// Strategy for locating the LiteRT-LM native libraries (libLiteRtLm and its
 /// companions, incl. the StreamProxy helper).
 ///
@@ -67,9 +69,16 @@ class LibraryLocator {
   }) = _CustomLocator;
 
   /// Path/name passed to `DynamicLibrary.open` for libLiteRtLm.
+  ///
+  /// Internal: the two-library (main + proxy) shape is an implementation
+  /// detail of the current native build — consumers pick a strategy via the
+  /// factories, never read these directly, so the shape can evolve (fold
+  /// StreamProxy in, add a delegate) without breaking the public contract.
+  @internal
   final String mainLibraryPath;
 
   /// Path/name for the StreamProxy helper (RTLD_GLOBAL loads, stderr capture).
+  @internal
   final String proxyLibraryPath;
 }
 

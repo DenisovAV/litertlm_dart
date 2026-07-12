@@ -35,6 +35,15 @@ const _modelPathOverride = String.fromEnvironment('MODEL_PATH');
 const _bundledModelAsset = 'assets/models/gemma4.litertlm';
 const _stagedModelFileName = 'gemma4.litertlm';
 
+/// A real `.litertlm` model is hundreds of MB; anything below this floor is a
+/// truncated/interrupted stage or a placeholder — reject it so a corrupt file
+/// isn't accepted as "staged and readable" (which would surface later as a
+/// cryptic engine-create error, disconnecting symptom from cause).
+const _minModelBytes = 100 * 1024 * 1024;
+
+bool _looksLikeModel(File f) =>
+    f.existsSync() && f.lengthSync() >= _minModelBytes;
+
 late final String _modelPath;
 
 /// Stages the bundled model asset to a writable file once, reusing it across
@@ -52,7 +61,7 @@ late final String _modelPath;
 Future<String> _stageBundledModel() async {
   final dir = await getApplicationSupportDirectory();
   final staged = File('${dir.path}/$_stagedModelFileName');
-  if (staged.existsSync() && staged.lengthSync() > 0) {
+  if (_looksLikeModel(staged)) {
     return staged.path;
   }
   final data = await rootBundle.load(_bundledModelAsset);
@@ -79,12 +88,12 @@ Future<String> _resolveModelPath() async {
   }
   final supportDir = await getApplicationSupportDirectory();
   final staged = File('${supportDir.path}/$_stagedModelFileName');
-  if (staged.existsSync() && staged.lengthSync() > 0) {
+  if (_looksLikeModel(staged)) {
     return staged.path;
   }
   final documentsDir = await getApplicationDocumentsDirectory();
   final pushed = File('${documentsDir.path}/$_stagedModelFileName');
-  if (pushed.existsSync() && pushed.lengthSync() > 0) {
+  if (_looksLikeModel(pushed)) {
     return pushed.path;
   }
   return _stageBundledModel();

@@ -60,6 +60,12 @@ void main() {
       final p = Prompt.user(text: 'transcribe', audio: Uint8List(4));
       expect(p.isMultimodal, isTrue);
     });
+
+    test('text defaults to empty for image-only prompts', () {
+      final p = Prompt.user(images: [Uint8List(4)]);
+      expect(p.text, isEmpty);
+      expect(p.isMultimodal, isTrue);
+    });
   });
 
   group('exceptions', () {
@@ -75,9 +81,30 @@ void main() {
       expect(e.attemptedPaths, hasLength(2));
     });
 
+    test('LibraryLoadException toString surfaces attempted paths', () {
+      final e = LibraryLoadException('nope', attemptedPaths: ['/a', '/b']);
+      final s = e.toString();
+      expect(s, contains('/a'));
+      expect(s, contains('/b'));
+    });
+
     test('EngineCreateException carries the native log tail', () {
       final e = EngineCreateException('boom', nativeLogTail: 'glog says hi');
       expect(e.nativeLogTail, contains('glog'));
+    });
+
+    test('EngineCreateException toString surfaces the native log tail', () {
+      final e = EngineCreateException('boom', nativeLogTail: 'executor.cc:734');
+      expect(e.toString(), contains('executor.cc:734'));
+    });
+
+    test('GenerationException carries + surfaces the native log tail', () {
+      final e = GenerationException(
+        'gen failed',
+        nativeLogTail: 'DYNAMIC_UPDATE',
+      );
+      expect(e.nativeLogTail, contains('DYNAMIC_UPDATE'));
+      expect(e.toString(), contains('DYNAMIC_UPDATE'));
     });
   });
 

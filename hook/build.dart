@@ -642,7 +642,25 @@ Future<void> _processBundle({
 
   // Non-owner stops here: cache is populated, but the owner registers the
   // shared CodeAssets to avoid a duplicate bundled-filename error.
-  if (!iAmRegistrant) return;
+  //
+  // WARN LOUDLY: this is the "stale-owner" footgun. If `$existingOwner` isn't
+  // actually in this app's dependency set (e.g. this project depends on
+  // `$_packageName` but the shared cache marker still names a package it once
+  // built alongside), THIS package skips registration and NOBODY bundles the
+  // libs → an opaque runtime `dlopen: no such file`, from a build that exited
+  // 0. Surfacing the skip turns that silent outage into an actionable message.
+  if (!iAmRegistrant) {
+    stderr.writeln(
+      'litertlm_dart: WARNING — "$_packageName" is NOT registering the '
+      '"${bundle.namespace}" native libraries: the shared cache marker at '
+      '${bundle.markerFile().path} is owned by "$existingOwner". If '
+      '"$existingOwner" is also a dependency of this app, this is fine (it '
+      'bundles them). If it is NOT, no native libraries will be bundled and '
+      'the app will fail at dlopen — run `flutter clean` and delete '
+      '${bundle.cacheRoot().path}, then rebuild.',
+    );
+    return;
+  }
 
   // Flutter's native-assets pipeline declares every `CodeAsset.file` as a
   // build OUTPUT and every `output.dependencies` entry as a build INPUT (see

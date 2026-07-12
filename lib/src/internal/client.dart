@@ -8,6 +8,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 import 'package:mutex/mutex.dart';
 
+import '../exceptions.dart';
 import '../library_locator.dart';
 import '../log_sink.dart';
 import '../bindings/litert_lm_bindings.dart';
@@ -377,7 +378,11 @@ class LiteRtLmFfiClient {
           ? lines
           : lines.sublist(lines.length - maxLines);
       return tail.join('\n');
-    } catch (_) {
+    } on FileSystemException catch (e) {
+      // Reading the diagnostic tail is best-effort; a filesystem error here
+      // must not mask the primary EngineCreateException it enriches. Log it so
+      // the drop isn't invisible, then return null.
+      _log('[LiteRtLmFfi] nativeLogTail: failed to read $p: $e');
       return null;
     }
   }
@@ -390,178 +395,212 @@ class LiteRtLmFfiClient {
     _log('[LiteRtLmFfi] Loading native libraries...');
     final DynamicLibrary lib;
     final DynamicLibrary proxyLib;
-    if (Platform.isIOS) {
-      // On iOS, Native Assets bundles dylibs in Frameworks/ inside Runner.app.
-      // The host app's Xcode project must also copy raw lib*.dylib files
-      // alongside the .framework bundles (see "Setup LiteRT-LM iOS" build
-      // phase in example/ios/Runner.xcodeproj/project.pbxproj) — needed
-      // because gpu_registry.cc uses relative-basename dlopen which iOS
-      // dyld 4 cannot resolve from .framework names alone.
-      lib = DynamicLibrary.open(_libraries.mainLibraryPath);
-      proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
-    } else if (Platform.isMacOS) {
-      // In a Flutter app the main lib is a `.framework` whose bundled Mach-O
-      // carries an @rpath to its companions (GemmaModelConstraintProvider,
-      // MetalAccelerator) staged alongside — a bare DynamicLibrary.open then
-      // resolves them. But when the locator points at a DIRECTORY of bare
-      // dylibs (LibraryLocator.fromDirectory — CLI/server, no framework, no
-      // rpath), that @rpath resolves to nothing and opening libLiteRtLm.dylib
-      // aborts the process. So: if the main lib lives in a real directory
-      // (path contains a separator and the companions sit next to it),
-      // RTLD_GLOBAL-preload those companions via StreamProxy first — same
-      // technique Linux uses below — so the main lib's @rpath deps are
-      // already resident. Framework-path loads skip this (no companion files
-      // next to a framework path) and behave exactly as before.
-      proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
-      final mainDir = File(_libraries.mainLibraryPath).parent;
-      final companionCandidates = [
-        '${mainDir.path}/libGemmaModelConstraintProvider.dylib',
-        '${mainDir.path}/libLiteRtMetalAccelerator.dylib',
-      ];
-      final anyCompanionPresent = companionCandidates.any(
-        (p) => File(p).existsSync(),
-      );
-      if (anyCompanionPresent) {
+    // Any failure loading the native libraries — a raw DynamicLibrary.open
+    // throw, a hand-authored RTLD_GLOBAL/LoadLibrary preload failure, or an
+    // unsupported platform/ABI — surfaces as a typed LibraryLoadException
+    // carrying the paths tried, honoring createEngine's documented contract
+    // (no fragile message string-matching at the boundary).
+    try {
+      if (Platform.isIOS) {
+        // On iOS, Native Assets bundles dylibs in Frameworks/ inside Runner.app.
+        // The host app's Xcode project must also copy raw lib*.dylib files
+        // alongside the .framework bundles (see "Setup LiteRT-LM iOS" build
+        // phase in example/ios/Runner.xcodeproj/project.pbxproj) — needed
+        // because gpu_registry.cc uses relative-basename dlopen which iOS
+        // dyld 4 cannot resolve from .framework names alone.
+        lib = DynamicLibrary.open(_libraries.mainLibraryPath);
+        proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
+      } else if (Platform.isMacOS) {
+        // In a Flutter app the main lib is a `.framework` whose bundled Mach-O
+        // carries an @rpath to its companions (GemmaModelConstraintProvider,
+        // MetalAccelerator) staged alongside — a bare DynamicLibrary.open then
+        // resolves them. But when the locator points at a DIRECTORY of bare
+        // dylibs (LibraryLocator.fromDirectory — CLI/server, no framework, no
+        // rpath), that @rpath resolves to nothing and opening libLiteRtLm.dylib
+        // aborts the process. So: if the main lib lives in a real directory
+        // (path contains a separator and the companions sit next to it),
+        // RTLD_GLOBAL-preload those companions via StreamProxy first — same
+        // technique Linux uses below — so the main lib's @rpath deps are
+        // already resident. Framework-path loads skip this (no companion files
+        // next to a framework path) and behave exactly as before.
+        proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
+        final mainDir = File(_libraries.mainLibraryPath).parent;
+        final companionCandidates = [
+          '${mainDir.path}/libGemmaModelConstraintProvider.dylib',
+          '${mainDir.path}/libLiteRtMetalAccelerator.dylib',
+        ];
+        final anyCompanionPresent = companionCandidates.any(
+          (p) => File(p).existsSync(),
+        );
+        if (anyCompanionPresent) {
+          final loadGlobal = proxyLib
+              .lookupFunction<
+                Pointer Function(Pointer<Utf8>),
+                Pointer Function(Pointer<Utf8>)
+              >('stream_proxy_load_global');
+          for (final path in companionCandidates) {
+            if (!File(path).existsSync()) continue;
+            final p = path.toNativeUtf8();
+            final h = loadGlobal(p);
+            calloc.free(p);
+            if (h == nullptr) {
+              _log('[LiteRtLmFfi] macOS: companion preload failed for $path');
+            }
+          }
+        }
+        lib = DynamicLibrary.open(_libraries.mainLibraryPath);
+      } else if (Platform.isLinux) {
+        // Load order matters: libLiteRt.so must be loaded first with
+        // RTLD_GLOBAL so libLiteRtLm.so (built with litert_link_capi_so=true)
+        // and the WebGPU accelerator can resolve LiteRt* C API symbols
+        // against it. StreamProxy exposes a dlopen helper because Dart's
+        // DynamicLibrary.open uses RTLD_LOCAL which hides symbols.
+        //
+        // Native Assets places .so files in <bundle>/lib/. Dart's
+        // DynamicLibrary.open finds them by basename via Flutter-set RPATH,
+        // but a raw C dlopen via stream_proxy_load_global doesn't see that
+        // path — pass an absolute path so it resolves regardless of
+        // LD_LIBRARY_PATH / RPATH inheritance.
+        // Preload directory: when the locator gives a real path (fromDirectory
+        // / custom — a CLI/server directory of bare .so files), preload the
+        // companions from NEXT TO the main lib; only fall back to the Native
+        // Assets `<exe>/lib` layout for defaultForPlatform's bare soname. Not
+        // deriving this here is exactly what broke the macOS CLI (locator dir
+        // ignored during preload) — Linux/Windows had the same latent gap.
+        final libDir =
+            _libraries.mainLibraryPath.contains(Platform.pathSeparator)
+            ? File(_libraries.mainLibraryPath).parent.path
+            : '${File(Platform.resolvedExecutable).parent.path}/lib';
+        proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
         final loadGlobal = proxyLib
             .lookupFunction<
               Pointer Function(Pointer<Utf8>),
               Pointer Function(Pointer<Utf8>)
             >('stream_proxy_load_global');
-        for (final path in companionCandidates) {
-          if (!File(path).existsSync()) continue;
-          final p = path.toNativeUtf8();
-          final h = loadGlobal(p);
-          calloc.free(p);
-          if (h == nullptr) {
-            _log('[LiteRtLmFfi] macOS: companion preload failed for $path');
+        // Preload sequence:
+        // - libLiteRt.so first (provides LiteRt C API used by the WebGPU
+        //   accelerator at registration)
+        // - libGemmaModelConstraintProvider.so (libLiteRtLm.so has a
+        //   SONAME-level dependency on it)
+        // - libLiteRtWebGpuAccelerator.so so gpu_registry.cc:162 can find it
+        //   via the loader's already-loaded modules table when it does
+        //   basename-only dlopen
+        // - libLiteRtLm.so itself
+        //
+        // libLiteRtTopKWebGpuSampler.so is intentionally NOT preloaded:
+        // its Create() holds a process-static wgpu::Instance and rejects
+        // any second engine_create with `wgpu::Instance already set`,
+        // making model swap and multi-session tests impossible. With the
+        // sampler not preloaded, sampler_factory.cc:443's dlopen returns
+        // Unavailable and the factory falls back to the static / CPU
+        // sampler chain — inference itself still runs on the GPU
+        // accelerator, only the per-token argmax happens on CPU
+        // (negligible perf hit, ~1-5ms/token).
+        for (final name in const [
+          'libLiteRt.so',
+          'libGemmaModelConstraintProvider.so',
+          'libLiteRtWebGpuAccelerator.so',
+          'libLiteRtLm.so',
+        ]) {
+          final fullPath = '$libDir/$name';
+          final pathPtr = fullPath.toNativeUtf8();
+          final handle = loadGlobal(pathPtr);
+          calloc.free(pathPtr);
+          if (handle == nullptr) {
+            throw Exception('Failed to load $fullPath with RTLD_GLOBAL');
           }
         }
-      }
-      lib = DynamicLibrary.open(_libraries.mainLibraryPath);
-    } else if (Platform.isLinux) {
-      // Load order matters: libLiteRt.so must be loaded first with
-      // RTLD_GLOBAL so libLiteRtLm.so (built with litert_link_capi_so=true)
-      // and the WebGPU accelerator can resolve LiteRt* C API symbols
-      // against it. StreamProxy exposes a dlopen helper because Dart's
-      // DynamicLibrary.open uses RTLD_LOCAL which hides symbols.
-      //
-      // Native Assets places .so files in <bundle>/lib/. Dart's
-      // DynamicLibrary.open finds them by basename via Flutter-set RPATH,
-      // but a raw C dlopen via stream_proxy_load_global doesn't see that
-      // path — pass an absolute path so it resolves regardless of
-      // LD_LIBRARY_PATH / RPATH inheritance.
-      final libDir = '${File(Platform.resolvedExecutable).parent.path}/lib';
-      proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
-      final loadGlobal = proxyLib
-          .lookupFunction<
-            Pointer Function(Pointer<Utf8>),
-            Pointer Function(Pointer<Utf8>)
-          >('stream_proxy_load_global');
-      // Preload sequence:
-      // - libLiteRt.so first (provides LiteRt C API used by the WebGPU
-      //   accelerator at registration)
-      // - libGemmaModelConstraintProvider.so (libLiteRtLm.so has a
-      //   SONAME-level dependency on it)
-      // - libLiteRtWebGpuAccelerator.so so gpu_registry.cc:162 can find it
-      //   via the loader's already-loaded modules table when it does
-      //   basename-only dlopen
-      // - libLiteRtLm.so itself
-      //
-      // libLiteRtTopKWebGpuSampler.so is intentionally NOT preloaded:
-      // its Create() holds a process-static wgpu::Instance and rejects
-      // any second engine_create with `wgpu::Instance already set`,
-      // making model swap and multi-session tests impossible. With the
-      // sampler not preloaded, sampler_factory.cc:443's dlopen returns
-      // Unavailable and the factory falls back to the static / CPU
-      // sampler chain — inference itself still runs on the GPU
-      // accelerator, only the per-token argmax happens on CPU
-      // (negligible perf hit, ~1-5ms/token).
-      for (final name in const [
-        'libLiteRt.so',
-        'libGemmaModelConstraintProvider.so',
-        'libLiteRtWebGpuAccelerator.so',
-        'libLiteRtLm.so',
-      ]) {
-        final fullPath = '$libDir/$name';
-        final pathPtr = fullPath.toNativeUtf8();
+        lib = DynamicLibrary.open(_libraries.mainLibraryPath);
+      } else if (Platform.isWindows) {
+        // Preload LiteRt.dll first so the WebGPU accelerator and TopK sampler
+        // can resolve LiteRt* C API + their own exports through the process
+        // module list before sampler_factory does its LoadLibrary lookup
+        // (mirrors the Linux/Android RTLD_GLOBAL pattern).
+        proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
+        final loadGlobal = proxyLib
+            .lookupFunction<
+              Pointer Function(Pointer<Utf8>),
+              Pointer Function(Pointer<Utf8>)
+            >('stream_proxy_load_global');
+        // When the locator gives a real directory path (fromDirectory/custom),
+        // preload the companion DLLs by absolute path from next to the main
+        // DLL; otherwise use bare names resolved via the process DLL search
+        // path (the default app-bundle layout).
+        final winDir =
+            _libraries.mainLibraryPath.contains(Platform.pathSeparator)
+            ? '${File(_libraries.mainLibraryPath).parent.path}${Platform.pathSeparator}'
+            : '';
+        for (final name in const [
+          'LiteRt.dll',
+          'libLiteRtTopKWebGpuSampler.dll',
+          'libLiteRtWebGpuAccelerator.dll',
+          'LiteRtLm.dll',
+        ]) {
+          final pathPtr = '$winDir$name'.toNativeUtf8();
+          final handle = loadGlobal(pathPtr);
+          calloc.free(pathPtr);
+          if (handle == nullptr) {
+            throw Exception('Failed to preload $winDir$name (LoadLibraryEx)');
+          }
+        }
+        lib = DynamicLibrary.open(_libraries.mainLibraryPath);
+      } else if (Platform.isAndroid) {
+        // LiteRT-LM ships native libs only for android_arm64 — bail with a
+        // typed message before dlopen surfaces a generic ENOENT on x86_64
+        // emulators / armeabi-v7a devices (#250). MediaPipe `.task` text
+        // inference still works on those ABIs through the Kotlin path; only
+        // `.litertlm` (FFI) requires arm64.
+        if (Abi.current() != Abi.androidArm64) {
+          throw UnsupportedError(
+            'flutter_gemma .litertlm models require an arm64-v8a Android device '
+            '(got ${Abi.current()}). Use a `.task` MediaPipe model on this ABI '
+            'or run on an arm64-v8a device / Apple Silicon emulator.',
+          );
+        }
+        // Load StreamProxy first (it has stream_proxy_load_global helper)
+        proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
+        // Load LiteRtLm with RTLD_GLOBAL so GPU accelerator plugins
+        // can find LiteRt* symbols via dlsym(RTLD_DEFAULT).
+        // Dart's DynamicLibrary.open uses RTLD_LOCAL which hides symbols.
+        final loadGlobal = proxyLib
+            .lookupFunction<
+              Pointer Function(Pointer<Utf8>),
+              Pointer Function(Pointer<Utf8>)
+            >('stream_proxy_load_global');
+        final pathPtr = _libraries.mainLibraryPath.toNativeUtf8();
         final handle = loadGlobal(pathPtr);
         calloc.free(pathPtr);
         if (handle == nullptr) {
-          throw Exception('Failed to load $fullPath with RTLD_GLOBAL');
+          // The most common cause we've seen is Android API < 30 (#265):
+          // upstream `libLiteRtLm.so` is built against Bionic 11+ libc and
+          // hard-references `pthread_cond_clockwait` / `sem_clockwait`,
+          // which don't exist on API 29 and below. Use a MediaPipe `.task`
+          // model instead, or bump `minSdkVersion` to 30.
+          throw Exception(
+            'Failed to load libLiteRtLm.so with RTLD_GLOBAL. '
+            'On Android, this commonly indicates API < 30: `.litertlm` models '
+            'require Android 11+ (minSdkVersion 30). For older devices use a '
+            'MediaPipe `.task` model instead. See '
+            'https://github.com/DenisovAV/flutter_gemma/issues/265',
+          );
         }
-      }
-      lib = DynamicLibrary.open(_libraries.mainLibraryPath);
-    } else if (Platform.isWindows) {
-      // Preload LiteRt.dll first so the WebGPU accelerator and TopK sampler
-      // can resolve LiteRt* C API + their own exports through the process
-      // module list before sampler_factory does its LoadLibrary lookup
-      // (mirrors the Linux/Android RTLD_GLOBAL pattern).
-      proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
-      final loadGlobal = proxyLib
-          .lookupFunction<
-            Pointer Function(Pointer<Utf8>),
-            Pointer Function(Pointer<Utf8>)
-          >('stream_proxy_load_global');
-      for (final name in const [
-        'LiteRt.dll',
-        'libLiteRtTopKWebGpuSampler.dll',
-        'libLiteRtWebGpuAccelerator.dll',
-        'LiteRtLm.dll',
-      ]) {
-        final pathPtr = name.toNativeUtf8();
-        final handle = loadGlobal(pathPtr);
-        calloc.free(pathPtr);
-        if (handle == nullptr) {
-          throw Exception('Failed to preload $name (LoadLibraryEx)');
-        }
-      }
-      lib = DynamicLibrary.open(_libraries.mainLibraryPath);
-    } else if (Platform.isAndroid) {
-      // LiteRT-LM ships native libs only for android_arm64 — bail with a
-      // typed message before dlopen surfaces a generic ENOENT on x86_64
-      // emulators / armeabi-v7a devices (#250). MediaPipe `.task` text
-      // inference still works on those ABIs through the Kotlin path; only
-      // `.litertlm` (FFI) requires arm64.
-      if (Abi.current() != Abi.androidArm64) {
-        throw UnsupportedError(
-          'flutter_gemma .litertlm models require an arm64-v8a Android device '
-          '(got ${Abi.current()}). Use a `.task` MediaPipe model on this ABI '
-          'or run on an arm64-v8a device / Apple Silicon emulator.',
+        lib = DynamicLibrary.open(
+          _libraries.mainLibraryPath,
+        ); // Now symbols are global
+      } else {
+        throw LibraryLoadException(
+          'Platform not supported for FFI: ${Platform.operatingSystem}',
         );
       }
-      // Load StreamProxy first (it has stream_proxy_load_global helper)
-      proxyLib = DynamicLibrary.open(_libraries.proxyLibraryPath);
-      // Load LiteRtLm with RTLD_GLOBAL so GPU accelerator plugins
-      // can find LiteRt* symbols via dlsym(RTLD_DEFAULT).
-      // Dart's DynamicLibrary.open uses RTLD_LOCAL which hides symbols.
-      final loadGlobal = proxyLib
-          .lookupFunction<
-            Pointer Function(Pointer<Utf8>),
-            Pointer Function(Pointer<Utf8>)
-          >('stream_proxy_load_global');
-      final pathPtr = _libraries.mainLibraryPath.toNativeUtf8();
-      final handle = loadGlobal(pathPtr);
-      calloc.free(pathPtr);
-      if (handle == nullptr) {
-        // The most common cause we've seen is Android API < 30 (#265):
-        // upstream `libLiteRtLm.so` is built against Bionic 11+ libc and
-        // hard-references `pthread_cond_clockwait` / `sem_clockwait`,
-        // which don't exist on API 29 and below. Use a MediaPipe `.task`
-        // model instead, or bump `minSdkVersion` to 30.
-        throw Exception(
-          'Failed to load libLiteRtLm.so with RTLD_GLOBAL. '
-          'On Android, this commonly indicates API < 30: `.litertlm` models '
-          'require Android 11+ (minSdkVersion 30). For older devices use a '
-          'MediaPipe `.task` model instead. See '
-          'https://github.com/DenisovAV/flutter_gemma/issues/265',
-        );
-      }
-      lib = DynamicLibrary.open(
-        _libraries.mainLibraryPath,
-      ); // Now symbols are global
-    } else {
-      throw UnsupportedError(
-        'Platform not supported for FFI: ${Platform.operatingSystem}',
+    } on LibraryLoadException {
+      rethrow;
+    } catch (e) {
+      throw LibraryLoadException(
+        'Failed to load the LiteRT-LM native libraries: $e',
+        attemptedPaths: [
+          _libraries.mainLibraryPath,
+          _libraries.proxyLibraryPath,
+        ],
       );
     }
 
@@ -644,9 +683,13 @@ class LiteRtLmFfiClient {
         : nullptr;
     final audioBackendPtr = enableAudio ? 'cpu'.toNativeUtf8() : nullptr;
 
+    // Hoisted so the finally frees it on EVERY exit path (a throw between
+    // create and the success-path delete used to leak it on every failing
+    // init — bad model, OOM, wrong ABI, missing NPU dir).
+    Pointer<LiteRtLmEngineSettings> settings = nullptr;
     try {
       final settingsCreateStart = initSw.elapsedMilliseconds;
-      final settings = b.litert_lm_engine_settings_create(
+      settings = b.litert_lm_engine_settings_create(
         modelPathPtr.cast(),
         backendPtr.cast(),
         visionBackendPtr == nullptr ? nullptr : visionBackendPtr.cast(),
@@ -657,7 +700,7 @@ class LiteRtLmFfiClient {
       );
 
       if (settings == nullptr) {
-        throw Exception('Failed to create engine settings');
+        throw EngineCreateException('Failed to create engine settings');
       }
 
       // Configure settings
@@ -777,8 +820,17 @@ class LiteRtLmFfiClient {
               >('stream_proxy_load_global');
           for (final path in macosCompanions) {
             final p = path.toNativeUtf8();
-            loadGlobal(p);
+            final h = loadGlobal(p);
             calloc.free(p);
+            if (h == nullptr) {
+              // A failed companion preload means the next open of a bare
+              // dylib with an unresolved @rpath ABORTS the process — leave a
+              // breadcrumb (the isolate can't reach the caller's LogSink).
+              // ignore: avoid_print
+              print(
+                '[LiteRtLmFfi] isolate: companion preload failed for $path',
+              );
+            }
           }
         }
         final lib = DynamicLibrary.open(mainLibPath);
@@ -813,11 +865,13 @@ class LiteRtLmFfiClient {
         '[LiteRtLmFfi] litert_lm_engine_create took ${sw.elapsedMilliseconds}ms',
       );
       b.litert_lm_engine_settings_delete(settings);
+      settings = nullptr; // freed — don't double-delete in the finally
 
       if (_engine == null || _engine == nullptr) {
         _dumpNativeLog();
-        throw Exception(
+        throw EngineCreateException(
           'Failed to create engine. Model may be invalid: $modelPath',
+          nativeLogTail: nativeLogTail(),
         );
       }
 
@@ -835,6 +889,7 @@ class LiteRtLmFfiClient {
       // dump only reads a file, doesn't touch native state.
       _dumpNativeLog();
     } finally {
+      if (settings != nullptr) b.litert_lm_engine_settings_delete(settings);
       calloc.free(modelPathPtr);
       calloc.free(backendPtr);
       if (visionBackendPtr != nullptr) calloc.free(visionBackendPtr);
@@ -1151,23 +1206,62 @@ class LiteRtLmFfiClient {
 
   /// Send a raw JSON message on the given conversation and get a streaming
   /// response. Holds [_nativeMutex] for the whole generation so concurrent
-  /// conversations don't race inside liblitert_lm; releases on completion or
-  /// error.
+  /// conversations don't race inside liblitert_lm; releases on completion,
+  /// error, OR cancel.
+  ///
+  /// Uses a StreamController (not `async*`): an `async*` generator's `finally`
+  /// only runs when the consumer drains or cancels, so a stream that's
+  /// listened-to then abandoned would hold [_nativeMutex] forever and
+  /// deadlock every other conversation's generation. The controller releases
+  /// the mutex on the subscription's done/cancel deterministically, and
+  /// handles cancel-during-acquire so a pending `acquire()` never strands the
+  /// lock.
   Stream<String> _sendMessageStreamRawOn(
     Pointer<LiteRtLmConversation> conv,
     String messageJson, {
     String? extraContext,
-  }) async* {
-    await _nativeMutex.acquire();
-    try {
-      yield* _doSendMessageStreamRawOn(
-        conv,
-        messageJson,
-        extraContext: extraContext,
-      );
-    } finally {
-      _nativeMutex.release();
+  }) {
+    final controller = StreamController<String>();
+    StreamSubscription<String>? inner;
+    var cancelled = false;
+    var mutexHeld = false;
+    void releaseMutex() {
+      if (mutexHeld) {
+        _nativeMutex.release();
+        mutexHeld = false;
+      }
     }
+
+    controller.onListen = () async {
+      await _nativeMutex.acquire();
+      mutexHeld = true;
+      // Consumer cancelled while we were waiting on the mutex — release it and
+      // don't start a native generation nobody is listening to.
+      if (cancelled) {
+        releaseMutex();
+        await controller.close();
+        return;
+      }
+      inner =
+          _doSendMessageStreamRawOn(
+            conv,
+            messageJson,
+            extraContext: extraContext,
+          ).listen(
+            controller.add,
+            onError: controller.addError,
+            onDone: () {
+              releaseMutex();
+              controller.close();
+            },
+          );
+    };
+    controller.onCancel = () async {
+      cancelled = true;
+      await inner?.cancel();
+      releaseMutex();
+    };
+    return controller.stream;
   }
 
   /// The single native conversation currently materialized for the

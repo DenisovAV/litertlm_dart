@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'backend.dart';
 import 'conversation.dart';
 import 'exceptions.dart';
@@ -20,14 +22,15 @@ abstract final class LiteRtLm {
   /// (the QNN dispatch libs live in the app's nativeLibraryDir; a Flutter
   /// adapter obtains it via a platform channel and passes it down).
   ///
-  /// Throws [LibraryLoadException] if the native libraries cannot be located,
-  /// [EngineCreateException] (with the native-log tail) if the model fails to
-  /// load.
+  /// Throws [LibraryLoadException] if the native libraries cannot be located
+  /// or loaded, [EngineCreateException] (with the native-log tail when
+  /// available) if the model fails to load.
   ///
-  /// [captureNativeLog] (default true) redirects native stderr (absl/glog) to
-  /// a temp file so [EngineCreateException] can carry it — but on macOS/Linux
-  /// that redirect also swallows the process's own stdout. A CLI/server that
-  /// prints to the console should pass `false`.
+  /// [captureNativeLog] (default FALSE) redirects native stderr (absl/glog) to
+  /// a temp file so [EngineCreateException] can carry the tail — but on
+  /// macOS/Linux that redirect also swallows the process's own stdout, so it
+  /// defaults off for the CLI/server audience. A Flutter app (whose stdout
+  /// isn't a console) can pass `true` to get richer engine-failure diagnostics.
   static Future<Engine> createEngine({
     required String modelPath,
     Backend backend = Backend.cpu,
@@ -39,7 +42,7 @@ abstract final class LiteRtLm {
     LibraryLocator? libraries,
     String? androidNativeLibDir,
     LogSink log = stdoutLogSink,
-    bool captureNativeLog = true,
+    bool captureNativeLog = false,
   }) async {
     final client = LiteRtLmFfiClient(
       log: log,
@@ -58,23 +61,16 @@ abstract final class LiteRtLm {
         enableAudio: audio,
       );
     } on LiteRtLmException {
+      // The client now throws the typed hierarchy at the source
+      // (LibraryLoadException at dlopen/preload sites, EngineCreateException
+      // at engine/settings-create sites), already carrying attemptedPaths /
+      // nativeLogTail. No fragile message string-matching here.
       rethrow;
     } catch (e) {
-      // The client throws plain Exceptions/StateErrors for load + create
-      // failures; map them to the package's typed hierarchy, carrying the
-      // native-log tail so an engine-create failure is diagnosable.
-      final message = e.toString();
-      if (message.contains('library') || message.contains('dlopen')) {
-        throw LibraryLoadException(
-          message,
-          attemptedPaths: [
-            client.librariesForDiagnostics.mainLibraryPath,
-            client.librariesForDiagnostics.proxyLibraryPath,
-          ],
-        );
-      }
+      // Last-resort catch for anything the client didn't type — surface it as
+      // an engine-create failure with whatever native tail exists.
       throw EngineCreateException(
-        message,
+        e.toString(),
         nativeLogTail: client.nativeLogTail(),
       );
     }
@@ -91,6 +87,9 @@ abstract interface class Engine {
   /// internally (the LiteRT-LM C API is not documented reentrant); `cancel`
   /// intentionally bypasses that serialization to interrupt an in-flight
   /// generation.
+  ///
+  /// Implement this interface only for testing/fakes; new methods may be
+  /// added in minor versions.
   Future<Conversation> createConversation({int? maxOutputTokens});
 
   /// Live conversations created by this engine and not yet closed.
@@ -114,9 +113,16 @@ class _EngineImpl implements Engine {
     if (_closed) {
       throw DisposedException('Engine is closed.');
     }
-    final handle = _client.createConversationHandle(
-      maxOutputTokens: maxOutputTokens,
-    );
+    final LiteRtLmConversationHandle handle;
+    try {
+      handle = _client.createConversationHandle(
+        maxOutputTokens: maxOutputTokens,
+      );
+    } on LiteRtLmException {
+      rethrow;
+    } catch (e) {
+      throw EngineCreateException('Failed to create conversation: $e');
+    }
     final convo = _ConversationImpl(handle, _forget);
     _conversations.add(convo);
     return convo;
@@ -128,10 +134,21 @@ class _EngineImpl implements Engine {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
-    for (final c in _conversations.toList()) {
-      await c.close();
+    // Always tear the native engine down, even if a conversation-close throws
+    // — otherwise a single failing conversation delete would leak the engine
+    // (shutdown() is the only litert_lm_engine_delete path).
+    try {
+      for (final c in _conversations.toList()) {
+        try {
+          await c.close();
+        } catch (_) {
+          // Per-conversation close failures must not abort engine teardown;
+          // shutdown() below force-closes any handles still open.
+        }
+      }
+    } finally {
+      _client.shutdown();
     }
-    _client.shutdown();
   }
 }
 
@@ -141,18 +158,57 @@ class _ConversationImpl implements Conversation {
   final void Function(_ConversationImpl) _onClose;
   bool _closed = false;
 
+  /// The controller of the currently-active generation, or null when idle.
+  /// Used both to reject overlapping generations and to drain an in-flight
+  /// generation before deleting the native conversation on [close].
+  StreamController<String>? _active;
+  StreamSubscription<String>? _activeSub;
+
   @override
   Stream<String> generateStream(Prompt prompt) {
     if (_closed) {
       throw DisposedException('Conversation is closed.');
     }
-    return _handle
-        .chat(
-          prompt.text,
-          imageBytes: prompt.images.isEmpty ? null : prompt.images,
-          audioBytes: prompt.audio,
-        )
-        .handleError((Object e) => throw GenerationException(e.toString()));
+    if (_active != null) {
+      // The native conversation mutates one shared history; two overlapping
+      // generations would interleave nondeterministically. One in flight at
+      // a time per conversation.
+      throw StateError(
+        'A generation is already in flight on this conversation.',
+      );
+    }
+    // A StreamController wrapper (not async*) so close() has a reliable
+    // completion signal to await, and cancelling the returned stream reliably
+    // stops the native generation and frees the mutex — the async* finally
+    // only runs when the consumer drains/cancels, which is the exact deadlock
+    // the client's virtual path was rewritten to avoid.
+    final controller = StreamController<String>();
+    _active = controller;
+    controller.onListen = () {
+      _activeSub = _handle
+          .chat(
+            prompt.text,
+            imageBytes: prompt.images.isEmpty ? null : prompt.images,
+            audioBytes: prompt.audio,
+          )
+          .listen(
+            controller.add,
+            onError: (Object e, StackTrace st) {
+              controller.addError(GenerationException(e.toString()), st);
+            },
+            onDone: () {
+              _active = null;
+              _activeSub = null;
+              controller.close();
+            },
+          );
+    };
+    controller.onCancel = () async {
+      await _activeSub?.cancel();
+      _active = null;
+      _activeSub = null;
+    };
+    return controller.stream;
   }
 
   @override
@@ -174,6 +230,22 @@ class _ConversationImpl implements Conversation {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    // If a generation is in flight, cancel it and wait for the native stream
+    // to finish BEFORE deleting the conversation — deleting the native
+    // conversation pointer out from under a running stream is a use-after-free.
+    final active = _active;
+    if (active != null) {
+      if (_activeSub != null) {
+        _handle
+            .cancelGeneration(); // native stop -> stream emits CANCELLED/done
+        await active.done.catchError((_) {});
+      } else {
+        // Never listened: no native generation started — just tear down.
+        await active.close();
+      }
+      _active = null;
+      _activeSub = null;
+    }
     _handle.close();
     _onClose(this);
   }
