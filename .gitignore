@@ -7,3 +7,4 @@ native/litert_lm/prebuilt/
 example/**/build/
 example/**/.dart_tool/
 example/flutter_host/assets/models/
+example/flutter_host/.model_backup_not_ios/

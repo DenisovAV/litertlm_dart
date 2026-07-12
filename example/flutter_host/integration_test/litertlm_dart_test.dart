@@ -33,15 +33,25 @@ import 'package:path_provider/path_provider.dart';
 
 const _modelPathOverride = String.fromEnvironment('MODEL_PATH');
 const _bundledModelAsset = 'assets/models/gemma4.litertlm';
+const _stagedModelFileName = 'gemma4.litertlm';
 
 late final String _modelPath;
 
 /// Stages the bundled model asset to a writable file once, reusing it across
-/// every test in this suite. Only used when MODEL_PATH is not supplied (e.g.
-/// on Firebase Test Lab, which has no adb push).
+/// every test in this suite. Only used when MODEL_PATH is not supplied and no
+/// pre-staged file was found (e.g. on Firebase Test Lab, which has no adb
+/// push, so the model travels inside the APK as an asset).
+///
+/// NOTE: `rootBundle.load` reads the whole asset into memory before writing
+/// it out. That's fine for Android (plenty of RAM on FTL devices) but a
+/// multi-GB model risks a jetsam OOM kill on iOS — see
+/// `flutter_asset_loader.dart` in flutter_gemma for the same caveat. On iOS
+/// prefer pushing the model into the app's Documents/ container via
+/// `xcrun devicectl device copy to` (see `_resolveModelPath` below) so this
+/// path is never taken there.
 Future<String> _stageBundledModel() async {
   final dir = await getApplicationSupportDirectory();
-  final staged = File('${dir.path}/gemma4.litertlm');
+  final staged = File('${dir.path}/$_stagedModelFileName');
   if (staged.existsSync() && staged.lengthSync() > 0) {
     return staged.path;
   }
@@ -53,15 +63,38 @@ Future<String> _stageBundledModel() async {
   return staged.path;
 }
 
+/// Resolves the model path to use for the whole suite, in order:
+///   1. `--dart-define=MODEL_PATH=...` (desktop/CLI — unchanged).
+///   2. An already-staged file in the app-support directory (re-run reuse).
+///   3. A file dropped into the app's Documents/ directory ahead of time —
+///      this is how the model gets onto a physical iOS device:
+///      `xcrun devicectl device copy to ... --destination Documents/gemma4.litertlm`.
+///      Used directly, no copy (avoids doubling disk usage for a multi-GB
+///      file and avoids the rootBundle full-file-in-memory read on iOS).
+///   4. The bundled asset fallback (Firebase Test Lab; Android only in
+///      practice — the asset is not embedded in the iOS IPA).
+Future<String> _resolveModelPath() async {
+  if (_modelPathOverride.isNotEmpty) {
+    return _modelPathOverride;
+  }
+  final supportDir = await getApplicationSupportDirectory();
+  final staged = File('${supportDir.path}/$_stagedModelFileName');
+  if (staged.existsSync() && staged.lengthSync() > 0) {
+    return staged.path;
+  }
+  final documentsDir = await getApplicationDocumentsDirectory();
+  final pushed = File('${documentsDir.path}/$_stagedModelFileName');
+  if (pushed.existsSync() && pushed.lengthSync() > 0) {
+    return pushed.path;
+  }
+  return _stageBundledModel();
+}
+
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
   setUpAll(() async {
-    if (_modelPathOverride.isNotEmpty) {
-      _modelPath = _modelPathOverride;
-      return;
-    }
-    _modelPath = await _stageBundledModel();
+    _modelPath = await _resolveModelPath();
   });
 
   testWidgets('MODEL_PATH is staged and readable', (_) async {
