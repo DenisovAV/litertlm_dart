@@ -32,9 +32,10 @@ dependencies:
     sdk: flutter
   litertlm_dart:
     path: ../..
-  # Used by the integration-test asset-staging fallback (Firebase Test Lab has
-  # no adb push — the model travels inside the APK as an asset and is copied
-  # to a writable file on first run). See integration_test/litertlm_dart_test.dart.
+  # Resolves the app-support/documents dirs where the integration test stages
+  # the model (streamed from HuggingFace on-device when no MODEL_PATH/pushed
+  # file is present — e.g. Firebase Test Lab). See
+  # integration_test/litertlm_dart_test.dart.
   path_provider: ^2.1.0
 
   # The following adds the Cupertino Icons font to your application.
@@ -65,11 +66,10 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  # The bundled model for the Firebase Test Lab asset-staging fallback (FTL
-  # has no adb push, so the model must travel inside the APK). Only present
-  # locally/on CI when staging for FTL — see integration_test/litertlm_dart_test.dart.
-  assets:
-    - assets/models/
+  # NOTE: the model is NOT bundled as an asset. A `.litertlm` model is multi-GB
+  # and `rootBundle.load` cannot read it (a Dart ByteData is capped at 2^30-1
+  # bytes). The integration test streams it from HuggingFace on-device instead
+  # (mirrors flutter_gemma's FTL recipe) — see integration_test/litertlm_dart_test.dart.
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

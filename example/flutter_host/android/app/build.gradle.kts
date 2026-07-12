@@ -28,6 +28,12 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // Required for `integration_test` to run under `gradlew assembleAndroidTest`
+        // on Firebase Test Lab. Local `flutter test -d <device>` injects this on
+        // the fly, but the raw gradlew path FTL uses does not — without it the
+        // androidTest APK ships zero test classes and FTL reports a vacuous
+        // "OK (0 tests)". Mirrors packages/flutter_gemma/example.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {

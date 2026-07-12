@@ -6,17 +6,20 @@
 ///   flutter test integration_test/litertlm_dart_test.dart -d DEVICE_ID \
 ///     --dart-define=MODEL_PATH=/abs/path/gemma-4-E2B-it.litertlm
 ///
-/// The model is NOT downloaded by the suite: stage it on the target first
-/// (desktop: any readable path; iOS: push to the app container's Documents/
-/// via `xcrun devicectl device copy to`; Android: `adb push` + /data/local
-/// or app dir). On iOS/macOS the app sandbox must be able to open the path.
+/// Model resolution order (see `_resolveModelPath`):
+///   1. `--dart-define=MODEL_PATH=/abs/model.litertlm` — desktop/CLI, used as-is.
+///   2. A pre-pushed / previously-staged file (re-run reuse; iOS `devicectl`
+///      copy to Documents/, Android `adb push` to the app dir).
+///   3. Otherwise the suite STREAMS the model from HuggingFace on-device into
+///      the app-support dir — this is how it runs on Firebase Test Lab (which
+///      has no adb push). Pass the gated-repo token at build time:
+///      `--dart-define=HUGGINGFACE_TOKEN=hf_...`.
 ///
-/// Firebase Test Lab fallback: FTL has no adb push, so when MODEL_PATH is
-/// unset this suite falls back to an asset bundled inside the APK
-/// (`assets/models/gemma4.litertlm`) and stages it once, in setUpAll, to a
-/// writable file under the app-support directory. The desktop/CLI
-/// `--dart-define=MODEL_PATH=...` override keeps working unchanged — the
-/// asset fallback only kicks in when that define is absent.
+/// The model is streamed to disk, never `rootBundle.load`: a `.litertlm` is
+/// multi-GB and a Dart ByteData is capped at 2^30-1 bytes (~1 GiB), so a
+/// full-file read throws `NewExternalTypedData ... range [0..1073741823]`.
+/// This mirrors flutter_gemma's FTL recipe (download on-device, token via
+/// --dart-define) instead of bundling a 2.4 GB APK asset.
 ///
 /// Until the 0.1.0 extraction lands, everything past the contract test is
 /// expected to FAIL with UnimplementedError — that is the TDD red state, not
@@ -25,14 +28,19 @@ library;
 
 import 'dart:io';
 
-import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:litertlm_dart/litertlm_dart.dart';
 import 'package:path_provider/path_provider.dart';
 
 const _modelPathOverride = String.fromEnvironment('MODEL_PATH');
-const _bundledModelAsset = 'assets/models/gemma4.litertlm';
+
+/// Gemma 4 E2B `.litertlm` — the same E2B artifact flutter_gemma's FTL suite
+/// uses. Gated on HuggingFace, so [_hfToken] (passed via
+/// `--dart-define=HUGGINGFACE_TOKEN=...`) is required to fetch it.
+const _modelUrl =
+    'https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm';
+const _hfToken = String.fromEnvironment('HUGGINGFACE_TOKEN');
 const _stagedModelFileName = 'gemma4.litertlm';
 
 /// A real `.litertlm` model is hundreds of MB; anything below this floor is a
@@ -46,30 +54,62 @@ bool _looksLikeModel(File f) =>
 
 late final String _modelPath;
 
-/// Stages the bundled model asset to a writable file once, reusing it across
-/// every test in this suite. Only used when MODEL_PATH is not supplied and no
-/// pre-staged file was found (e.g. on Firebase Test Lab, which has no adb
-/// push, so the model travels inside the APK as an asset).
+/// Streams the model from [_modelUrl] to a writable file once, reusing it
+/// across every test in this suite. Only used when MODEL_PATH is not supplied
+/// and no pre-staged file was found (e.g. on Firebase Test Lab, which has no
+/// adb push).
 ///
-/// NOTE: `rootBundle.load` reads the whole asset into memory before writing
-/// it out. That's fine for Android (plenty of RAM on FTL devices) but a
-/// multi-GB model risks a jetsam OOM kill on iOS — see
-/// `flutter_asset_loader.dart` in flutter_gemma for the same caveat. On iOS
-/// prefer pushing the model into the app's Documents/ container via
-/// `xcrun devicectl device copy to` (see `_resolveModelPath` below) so this
-/// path is never taken there.
-Future<String> _stageBundledModel() async {
+/// The response is piped straight to disk (never held whole in memory), so it
+/// is immune to the ~1 GiB Dart-ByteData ceiling that `rootBundle.load` /
+/// `response.bodyBytes` would hit on a 2.4 GB model. HuggingFace 302-redirects
+/// the `resolve/...` URL to a signed CDN host that needs no auth; the redirect
+/// is followed manually so the Bearer token is only ever sent to
+/// `huggingface.co`, never leaked to (or rejected by) the CDN.
+Future<String> _downloadModel() async {
   final dir = await getApplicationSupportDirectory();
-  final staged = File('${dir.path}/$_stagedModelFileName');
-  if (_looksLikeModel(staged)) {
-    return staged.path;
+  final dest = File('${dir.path}/$_stagedModelFileName');
+  if (_looksLikeModel(dest)) {
+    return dest.path;
   }
-  final data = await rootBundle.load(_bundledModelAsset);
-  await staged.writeAsBytes(
-    data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
-    flush: true,
-  );
-  return staged.path;
+  final originHost = Uri.parse(_modelUrl).host;
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 60);
+  try {
+    var uri = Uri.parse(_modelUrl);
+    late HttpClientResponse resp;
+    for (var hop = 0; ; hop++) {
+      final req = await client.getUrl(uri);
+      req.followRedirects = false;
+      if (uri.host == originHost && _hfToken.isNotEmpty) {
+        req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $_hfToken');
+      }
+      resp = await req.close();
+      if (resp.statusCode == HttpStatus.ok) break;
+      final location = resp.headers.value(HttpHeaders.locationHeader);
+      if (resp.isRedirect && location != null) {
+        if (hop >= 5) {
+          throw StateError('Too many redirects fetching $_modelUrl');
+        }
+        final next = Uri.parse(location);
+        uri = next.hasScheme ? next : uri.resolveUri(next);
+        await resp.drain<void>();
+        continue;
+      }
+      throw StateError(
+        'Model download failed: HTTP ${resp.statusCode} from $uri',
+      );
+    }
+    // Stream to a .part file, then atomically rename — a half-written file is
+    // never accepted as "staged" on a re-run.
+    final part = File('${dest.path}.part');
+    await resp.pipe(part.openWrite());
+    await part.rename(dest.path);
+  } finally {
+    client.close(force: true);
+  }
+  if (!_looksLikeModel(dest)) {
+    throw StateError('Downloaded model is undersized: ${dest.path}');
+  }
+  return dest.path;
 }
 
 /// Resolves the model path to use for the whole suite, in order:
@@ -78,10 +118,9 @@ Future<String> _stageBundledModel() async {
 ///   3. A file dropped into the app's Documents/ directory ahead of time —
 ///      this is how the model gets onto a physical iOS device:
 ///      `xcrun devicectl device copy to ... --destination Documents/gemma4.litertlm`.
-///      Used directly, no copy (avoids doubling disk usage for a multi-GB
-///      file and avoids the rootBundle full-file-in-memory read on iOS).
-///   4. The bundled asset fallback (Firebase Test Lab; Android only in
-///      practice — the asset is not embedded in the iOS IPA).
+///      Used directly, no copy (avoids doubling disk usage for a multi-GB file).
+///   4. Otherwise stream the model from HuggingFace to app-support (Firebase
+///      Test Lab and any device without a pre-staged file).
 Future<String> _resolveModelPath() async {
   if (_modelPathOverride.isNotEmpty) {
     return _modelPathOverride;
@@ -96,28 +135,33 @@ Future<String> _resolveModelPath() async {
   if (_looksLikeModel(pushed)) {
     return pushed.path;
   }
-  return _stageBundledModel();
+  return _downloadModel();
 }
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
-  setUpAll(() async {
-    _modelPath = await _resolveModelPath();
-  });
-
-  testWidgets('MODEL_PATH is staged and readable', (_) async {
-    expect(
-      _modelPath,
-      isNotEmpty,
-      reason: 'pass --dart-define=MODEL_PATH=/abs/model.litertlm',
-    );
-    expect(
-      File(_modelPath).existsSync(),
-      isTrue,
-      reason: 'model not staged at $_modelPath',
-    );
-  });
+  // Resolve/stage the model as the FIRST test (not setUpAll) so the cold
+  // ~2.4 GB HuggingFace download on FTL gets an explicit generous timeout
+  // instead of the default per-item one. Later tests reuse `_modelPath`.
+  testWidgets(
+    'model is staged/downloaded and readable',
+    (_) async {
+      _modelPath = await _resolveModelPath();
+      expect(
+        _modelPath,
+        isNotEmpty,
+        reason:
+            'set --dart-define=MODEL_PATH=... or --dart-define=HUGGINGFACE_TOKEN=...',
+      );
+      expect(
+        _looksLikeModel(File(_modelPath)),
+        isTrue,
+        reason: 'model missing/undersized at $_modelPath',
+      );
+    },
+    timeout: const Timeout(Duration(minutes: 20)),
+  );
 
   testWidgets('engine creates and closes (CPU)', (_) async {
     final engine = await LiteRtLm.createEngine(
