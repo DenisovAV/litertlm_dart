@@ -1,0 +1,5 @@
+# Internal design/plan docs — not part of the published package.
+docs/
+
+# Stray coverage artifacts.
+*.profraw
