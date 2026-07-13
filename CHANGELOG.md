@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- Trim the package description to pub.dev's 60–180 character range.
+- Add `example/README.md` so the example is discovered by pub.dev / pana.
+
 ## 0.1.0
 
 First runtime release — the LiteRT-LM engine extracted from `flutter_gemma_litertlm`.
