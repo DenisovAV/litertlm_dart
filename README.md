@@ -18,7 +18,7 @@ import 'package:litertlm_dart/litertlm_dart.dart';
 Future<void> main() async {
   final engine = await LiteRtLm.createEngine(
     modelPath: 'gemma-4-E2B-it.litertlm',
-    backend: Backend.gpu, // falls back to CPU when unavailable
+    backend: Backend.gpu, // GPU accelerator; use Backend.cpu to force CPU
     maxTokens: 2048,      // context window (input + output), not reply length
   );
 

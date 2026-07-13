@@ -12,7 +12,7 @@ Future<void> main(List<String> args) async {
 
   final engine = await LiteRtLm.createEngine(
     modelPath: modelPath,
-    backend: Backend.gpu, // falls back to CPU when unavailable
+    backend: Backend.gpu, // GPU accelerator; use Backend.cpu to force CPU
     maxTokens: 2048,      // context window (input + output), not reply length
   );
 
@@ -34,7 +34,8 @@ Future<void> main(List<String> args) async {
 
   ```sh
   cd cli
-  dart --enable-experiment=native-assets run bin/generate.dart --model /path/to/model.litertlm
+  # model path is positional; optional: [prompt] [--libs=<dir>] [--backend=cpu|gpu]
+  dart --enable-experiment=native-assets run bin/generate.dart /path/to/model.litertlm
   ```
 
 * **`flutter_host/`** — a Flutter app that hosts the cross-platform integration
