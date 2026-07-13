@@ -1,9 +1,8 @@
 name: litertlm_dart
 description: >-
-  Pure Dart runtime for Google's LiteRT-LM: FFI bindings, engine and
-  conversation lifecycle, and streaming on-device LLM inference. No Flutter
-  dependency — runs from CLI, server, or app.
-version: 0.1.0
+  Pure Dart runtime for Google's LiteRT-LM: FFI bindings, engine/conversation
+  lifecycle, and streaming on-device LLM inference. No Flutter dependency.
+version: 0.1.1
 repository: https://github.com/DenisovAV/litertlm_dart
 issue_tracker: https://github.com/DenisovAV/litertlm_dart/issues
 topics:
